@@ -14,6 +14,9 @@ const unix = {
   EINTR: 4,
   EIO: 5,
   ENXIO: 6,
+  ENOTDIR: 20,
+  EISDIR: 21,
+  ENOTEMPTY: 39, // FIXME: 66 on macOS
   ENOTSUP: 45,
   ETIMEDOUT: 110, // FIXME: not on macOS (?)
 
@@ -755,6 +758,187 @@ Routes["/extensions/:EXTENSION_TITLE.:EXTENSION_ID/enabled"] = { ...makeRouteWit
 
   // suppress truncate so it doesn't accidentally flip the state when you do, e.g., `echo true >`
 }), truncate() { return {}; } };
+
+(function() {
+  // The bookmark tree is mirrored as a directory hierarchy under
+  // /bookmarks: folders are directories, and each bookmark is a file
+  // whose contents are its URL.
+  const MAX_BOOKMARK_DEPTH = 8;
+
+  // Names a folder's children: a child's filename is its sanitized
+  // title; duplicate (or empty) titles in the same folder get a
+  // `.<ID>` suffix so every entry is distinct.
+  function childEntries(folderNode) {
+    const counts = {};
+    for (let child of folderNode.children) {
+      const name = sanitize(String(child.title));
+      counts[name] = (counts[name] || 0) + 1;
+    }
+    const entries = {};
+    for (let child of folderNode.children) {
+      let name = sanitize(String(child.title));
+      if (name === '' || counts[name] > 1) { name += '.' + child.id; }
+      entries[name] = child;
+    }
+    return entries;
+  }
+
+  async function resolveBookmark(path) {
+    // path is like /bookmarks/Bookmarks_bar/Cooking/Pancakes
+    const segments = path.split('/').slice(2).filter(s => s !== '');
+    let [node] = await browser.bookmarks.getTree();
+    for (let segment of segments) {
+      if (!node.children) { throw new UnixError(unix.ENOTDIR); }
+      node = childEntries(node)[segment] ||
+        // fall back to the raw title, so a file freshly created with
+        // characters that sanitize() rewrites (e.g. spaces) can still
+        // be opened under the name it was created with
+        node.children.find(child => String(child.title) === segment);
+      if (!node) { throw new UnixError(unix.ENOENT); }
+    }
+    return node;
+  }
+
+  function bookmarkTitleForPath(path) {
+    return path.substr(path.lastIndexOf('/') + 1);
+  }
+
+  const bookmarkContents = makeRouteWithContents(async ({path}) => {
+    const node = await resolveBookmark(path);
+    if (node.children) { throw new UnixError(unix.EISDIR); }
+    return node.url + '\n';
+
+  }, async ({path}, buf) => {
+    // ignore the empty write from `>`-style truncation so the URL
+    // isn't clobbered before the real contents arrive
+    buf = buf.trim();
+    if (buf === '') { return; }
+    const node = await resolveBookmark(path);
+    await browser.bookmarks.update(node.id, {url: buf});
+  });
+
+  const bookmarkRoute = {
+    description: `A bookmark folder (a directory you can mkdir in)
+or a single bookmark (a file whose contents are its URL).`,
+    usage: ['ls $0',
+            'cat $0',
+            'mkdir $0',
+            'echo "https://www.google.com" > $0',
+            'rm $0'],
+    ...bookmarkContents,
+    async getattr(req) {
+      const node = await resolveBookmark(req.path);
+      if (node.children) {
+        return {
+          st_mode: unix.S_IFDIR | 0o777, // writable so you can create/rm bookmarks
+          st_nlink: 3,
+          st_size: 0,
+        };
+      }
+      return bookmarkContents.getattr(req);
+    },
+    async readdir({path}) {
+      const node = await resolveBookmark(path);
+      if (!node.children) { throw new UnixError(unix.ENOTDIR); }
+      return { entries: [".", "..", ...Object.keys(childEntries(node))] };
+    },
+    opendir() { return { fh: 0 }; },
+    releasedir() { return {}; },
+    async mkdir({path}) {
+      const parent = await resolveBookmark(path.substr(0, path.lastIndexOf('/')));
+      await browser.bookmarks.create({parentId: parent.id,
+                                      title: bookmarkTitleForPath(path)});
+      return {};
+    },
+    async mknod({path}) {
+      const parent = await resolveBookmark(path.substr(0, path.lastIndexOf('/')));
+      await browser.bookmarks.create({parentId: parent.id,
+                                      title: bookmarkTitleForPath(path),
+                                      url: 'about:blank'});
+      return {};
+    },
+    async unlink({path}) {
+      const node = await resolveBookmark(path);
+      await browser.bookmarks.remove(node.id);
+      return {};
+    },
+    async rmdir({path}) {
+      const node = await resolveBookmark(path);
+      if (node.children && node.children.length > 0) {
+        throw new UnixError(unix.ENOTEMPTY);
+      }
+      await browser.bookmarks.remove(node.id);
+      return {};
+    }
+  };
+  for (let depth = 1; depth <= MAX_BOOKMARK_DEPTH; depth++) {
+    // route variable names can't contain digits, so :PATH_A/:PATH_B/...
+    const key = '/bookmarks/' +
+          Array.from({length: depth},
+                     (_, i) => ':PATH_' + String.fromCharCode(65 + i)).join('/');
+    Routes[key] = {...bookmarkRoute};
+  }
+
+  Routes["/bookmarks"] = {
+    description: `The bookmark tree, mirrored as files and folders.`,
+    usage: 'ls $0',
+    async readdir() {
+      const [root] = await browser.bookmarks.getTree();
+      return { entries: [".", "..", "by-id", ...Object.keys(childEntries(root))] };
+    }
+  };
+
+  Routes["/bookmarks/by-id"] = {
+    description: `All bookmarks and bookmark folders, flat, by ID.`,
+    usage: 'ls $0',
+    async readdir() {
+      const [root] = await browser.bookmarks.getTree();
+      const ids = [];
+      (function walk(node) {
+        if (node.id !== root.id) { ids.push(node.id); }
+        (node.children || []).forEach(walk);
+      })(root);
+      return { entries: [".", "..", ...ids] };
+    }
+  };
+  Routes["/bookmarks/by-id/:NODE_ID"] = {
+    description: `Represents one bookmark or bookmark folder.`,
+    usage: 'ls $0',
+    async readdir({nodeId}) {
+      const [node] = await browser.bookmarks.get(nodeId);
+      return { entries: [".", "..", "title.txt", ...(node.url ? ["url.txt"] : [])] };
+    }
+  };
+  Routes["/bookmarks/by-id/:NODE_ID/title.txt"] = {
+    description: `Text file containing the title of this bookmark or folder.`,
+    usage: ['cat $0',
+            'echo "New title" > $0'],
+    ...makeRouteWithContents(async ({nodeId}) => {
+      const [node] = await browser.bookmarks.get(nodeId);
+      return node.title + '\n';
+
+    }, async ({nodeId}, buf) => {
+      buf = buf.trim();
+      if (buf === '') { return; } // ignore `>`-style truncation
+      await browser.bookmarks.update(nodeId, {title: buf});
+    })
+  };
+  Routes["/bookmarks/by-id/:NODE_ID/url.txt"] = {
+    description: `Text file containing the URL of this bookmark.`,
+    usage: ['cat $0',
+            'echo "https://www.google.com" > $0'],
+    ...makeRouteWithContents(async ({nodeId}) => {
+      const [node] = await browser.bookmarks.get(nodeId);
+      if (!node.url) { throw new UnixError(unix.ENOENT); }
+      return node.url + '\n';
+
+    }, async ({nodeId}, buf) => {
+      buf = buf.trim();
+      if (buf === '') { return; } // ignore `>`-style truncation
+      await browser.bookmarks.update(nodeId, {url: buf});
+    })
+  };
+})();
 
 Routes["/runtime/reload"] = {
   async write({buf}) {

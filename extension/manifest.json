@@ -7,7 +7,7 @@
 
   "permissions": [
     "tabs", "tabCapture", "debugger", "nativeMessaging", "management",
-    "unlimitedStorage", "scripting"
+    "unlimitedStorage", "scripting", "bookmarks"
   ],
 
   "host_permissions": [

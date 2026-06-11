@@ -397,6 +397,18 @@ static int tabfs_unlink(const char *path) {
     return 0;
 }
 
+static int tabfs_rmdir(const char *path) {
+    char *rdata;
+    size_t rsize;
+    exchange_json(&rdata, &rsize,
+        "op: %Q, path: %Q",
+        "rmdir", path);
+
+    parse_and_free_response(rdata, rsize, "");
+
+    return 0;
+}
+
 static int tabfs_mkdir(const char *path, mode_t mode) {
     char *rdata;
     size_t rsize;
@@ -440,6 +452,7 @@ static const struct fuse_operations tabfs_oper = {
     .unlink   = tabfs_unlink,
 
     .mkdir  = tabfs_mkdir,
+    .rmdir  = tabfs_rmdir,
     .mknod = tabfs_mknod,
 };
 
