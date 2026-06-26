@@ -106,6 +106,14 @@ async function executeScript(tabId, code, allFrames = false) {
     });
     return results.map(r => r.result);
   } catch (e) {
+    // Pages the content script can't touch (chrome://, the Web Store,
+    // other extensions, view-source:, etc. -- all excluded from
+    // <all_urls>) throw here whenever the OS stat()s their text.txt /
+    // body.html. That's expected, not a bug, so surface it as a plain
+    // EIO without logging instead of a scary raw error.
+    if (/Cannot access (a chrome:\/\/ URL|contents of the page)/.test(e.message)) {
+      throw new UnixError(unix.EIO);
+    }
     console.error('executeScript error:', e);
     throw e;
   }
@@ -1170,7 +1178,10 @@ async function onMessage(req) {
     }
 
   } catch (e) {
-    console.error(e);
+    // A UnixError is a deliberate, mapped filesystem result (ENOENT,
+    // EIO for an unreachable page, etc.) -- normal control flow, so
+    // don't log it. Only unexpected raw errors are worth a console line.
+    if (!(e instanceof UnixError)) { console.error(e); }
     response = {
       op: req.op,
       error: e instanceof UnixError ? e.error : unix.EIO
