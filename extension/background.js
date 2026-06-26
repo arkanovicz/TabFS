@@ -570,27 +570,76 @@ see https://developer.chrome.com/extensions/tabs.`,
       } else if (method === "Debugger.scriptParsed") {
         TabManager.scriptsForTab[source.tabId] = TabManager.scriptsForTab[source.tabId] || {};
         TabManager.scriptsForTab[source.tabId][params.scriptId] = params;
+
+      } else if (method === "Runtime.consoleAPICalled") {
+        // a console.log/warn/error/... call in the page
+        TabManager.recordConsole(source.tabId, {
+          timestamp: params.timestamp,
+          type: params.type,
+          text: (params.args || []).map(stringifyRemoteObject).join(' ')
+        });
+
+      } else if (method === "Runtime.exceptionThrown") {
+        // an uncaught exception in the page
+        const details = params.exceptionDetails || {};
+        TabManager.recordConsole(source.tabId, {
+          timestamp: params.timestamp,
+          type: 'exception',
+          text: details.exception ? stringifyRemoteObject(details.exception)
+                                   : (details.text || 'uncaught exception')
+        });
       }
+    });
+
+    // When our debugger session ends (tab closed, DevTools took over,
+    // navigation to an undebuggable page), forget the attach/enable state so
+    // the next operation re-attaches and re-enables from scratch.
+    if (chrome.debugger) chrome.debugger.onDetach.addListener((source, reason) => {
+      delete TabManager.attachedTabs[source.tabId];
+      delete TabManager.enabledForTab[source.tabId];
+      delete TabManager.scriptsForTab[source.tabId];
     });
 
     return {
       scriptsForTab: {},
+      // tabId -> array of buffered console entries {timestamp, type, text}.
+      // Enabling Runtime replays the page's existing console history, so the
+      // first read of a tab's console already shows past messages; new ones
+      // stream in afterwards. (Attach/enable are made idempotent below so we
+      // don't re-trigger that replay -- and re-append it -- on every read.)
+      consoleForTab: {},
+      recordConsole: function(tabId, entry) {
+        const buf = TabManager.consoleForTab[tabId] =
+          TabManager.consoleForTab[tabId] || [];
+        buf.push(entry);
+        // cap memory: keep only the most recent entries
+        if (buf.length > 1000) { buf.shift(); }
+      },
+      // tabId -> true once we hold a debugger session, and tabId -> Set of
+      // enabled CDP domains. Both are cleared by the onDetach listener below
+      // when the session goes away (tab closed, DevTools opened, navigation
+      // to an undebuggable page), so the next op cleanly re-attaches.
+      attachedTabs: {},
+      enabledForTab: {},
       debugTab: async function(tabId) {
-        // meant to be higher-level wrapper for raw attach/detach
-        // TODO: could we remember if we're already attached? idk if it's worth it
+        if (TabManager.attachedTabs[tabId]) { return; } // already attached -- don't re-attach
         try { await attachDebugger(tabId); }
         catch (e) {
           if (e.message.indexOf('Another debugger is already attached') !== -1) {
+            // someone else (e.g. DevTools) holds it; take it over
             await detachDebugger(tabId);
             await attachDebugger(tabId);
-          }
+          } else { throw e; }
         }
-        // TODO: detach automatically? some kind of reference counting thing?
+        TabManager.attachedTabs[tabId] = true;
       },
       enableDomainForTab: async function(tabId, domain) {
-        // TODO: could we remember if we're already enabled? idk if it's worth it
+        const enabled = TabManager.enabledForTab[tabId] =
+          TabManager.enabledForTab[tabId] || new Set();
+        if (enabled.has(domain)) { return; } // already enabled -- don't replay events again
         if (domain === 'Debugger') { TabManager.scriptsForTab[tabId] = {}; }
         await sendDebuggerCommand(tabId, `${domain}.enable`, {});
+        enabled.add(domain);
       }
     };
   })();
@@ -666,6 +715,64 @@ see https://developer.chrome.com/extensions/tabs.`,
     const {scriptId} = pathScriptInfo(tabId, filename);
     await sendDebuggerCommand(tabId, "Debugger.setScriptSource", {scriptId, scriptSource: buf});
   });
+
+  // Render a CDP RemoteObject (a console arg / thrown exception) to a
+  // short string, the way it would read in the DevTools console.
+  function stringifyRemoteObject(o) {
+    if (!o) { return ''; }
+    if ('value' in o) {
+      return typeof o.value === 'string' ? o.value : JSON.stringify(o.value);
+    }
+    if ('unserializableValue' in o) { return String(o.unserializableValue); }
+    // an Error's description is its full stack trace -- nicer than its preview
+    if (o.subtype === 'error' && o.description) { return o.description; }
+    // objects/arrays come with a shallow `preview` for console args; render it
+    // like DevTools ({a: 1, b: Array(2)}) instead of a bare "Object".
+    if (o.preview) { return stringifyPreview(o.preview); }
+    return o.description || o.subtype || o.type || '';
+  }
+  function stringifyPreview(p) {
+    const props = (p.properties || [])
+      .map(pr => p.subtype === 'array' ? pr.value : `${pr.name}: ${pr.value}`);
+    if (p.overflow) { props.push('…'); }
+    return p.subtype === 'array' ? `[${props.join(', ')}]` : `{${props.join(', ')}}`;
+  }
+  function formatConsoleEntry({timestamp, type, text}) {
+    const time = new Date(timestamp).toISOString();
+    return `${time} [${type}] ${text}`;
+  }
+
+  Routes["/tabs/by-id/#TAB_ID/console"] = {
+    description: `Console output (console.* calls and uncaught exceptions) for this tab.
+Reading this file attaches the debugger and replays the page's console history,
+then streams new messages. Truncate (e.g. \`: > $0\`) to clear the buffer.`,
+    usage: ['cat $0',
+            ': > $0'],
+    ...makeRouteWithContents(async ({tabId}) => {
+      await TabManager.debugTab(tabId);
+      await TabManager.enableDomainForTab(tabId, "Runtime");
+      const entries = TabManager.consoleForTab[tabId] || [];
+      return entries.map(formatConsoleEntry).join('\n') + (entries.length ? '\n' : '');
+
+    }, () => {
+      // setData exists only so the file reports as writable, so truncate
+      // can clear it without a permission prompt; writes themselves no-op.
+    }),
+    // Crucial: DON'T attach the debugger just to stat the file. getattr is
+    // called very cavalierly (`ls -l` on the tab dir, the OS walking the
+    // tree), and attaching shows Chrome's "started debugging this browser"
+    // banner. Report a static, writable file here; the debugger only attaches
+    // on an actual read (open). Size is a generous fixed value -- like
+    // visible-tab.png -- so the read isn't clamped short; reads past the real
+    // end return empty (EOF).
+    getattr() {
+      return { st_mode: unix.S_IFREG | 0o666, st_nlink: 1, st_size: 10*1024*1024 };
+    },
+    async truncate({tabId}) {
+      TabManager.consoleForTab[tabId] = [];
+      return {};
+    }
+  };
 })();
 
 Routes["/tabs/by-id/#TAB_ID/inputs"] = {
