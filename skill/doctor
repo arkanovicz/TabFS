@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# TabFS doctor — verify the live-Chrome filesystem is mounted, responsive, and
+# wired to the browser extension. Run this BEFORE trying to read/act on tabs;
+# it turns the usual silent failure modes (a hung mount, a missing native
+# manifest) into a clear message.
+#
+# Exit status: 0 = ready to use, 1 = something needs fixing.
+#
+# Override the mount location with TABFS_MOUNT (default: ~/chrome).
+
+set -u
+
+MOUNT="${TABFS_MOUNT:-$HOME/chrome}"
+problems=0
+
+# --- pretty output (degrades to plain text when not a TTY) ----------------
+if [ -t 1 ]; then G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; X=$'\e[0m'
+else G=; Y=; R=; B=; X=; fi
+pass() { printf '%s  %s\n'      "${G}✓${X}" "$1"; }
+warn() { printf '%s  %s\n'      "${Y}!${X}" "$1"; }
+fail() { printf '%s  %s\n'      "${R}✗${X}" "$1"; problems=$((problems+1)); }
+hint() { printf '     ↳ %s\n'   "$1"; }
+
+# --- a timeout wrapper, because a hung FUSE mount is THE failure mode ------
+# (an op against a wedged mount blocks forever; we must not inherit that.)
+TIMEOUT=
+if command -v timeout  >/dev/null 2>&1; then TIMEOUT=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT=gtimeout; fi
+run() { # run SECS CMD...  -> 0 ok, 124 timed out, other = command error
+  if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$@"; else shift; "$@"; fi
+}
+
+printf '%sTabFS doctor%s  (mount: %s)\n\n' "$B" "$X" "$MOUNT"
+
+# === 1. mount exists ======================================================
+if [ -e "$MOUNT" ]; then
+  if [ -L "$MOUNT" ]; then pass "mount path exists ($MOUNT → $(readlink "$MOUNT"))"
+  else                     pass "mount path exists ($MOUNT)"; fi
+else
+  fail "no mount at $MOUNT"
+  hint "start the native FUSE program (fs/tabfs) so it mounts there,"
+  hint "or point TABFS_MOUNT at the real location."
+  printf '\n%sNot mounted — stopping.%s\n' "$B" "$X"; exit 1
+fi
+
+# === 2. mount is responsive (this also proves the extension is connected) ==
+# The filesystem only answers a readdir if the browser extension replies over
+# native messaging, so a successful `ls` means native ↔ extension is alive.
+run 5 ls "$MOUNT/tabs" >/dev/null 2>&1; rc=$?
+if   [ "$rc" -eq 0 ];   then pass "mount is responsive (extension is connected)"
+elif [ "$rc" -eq 124 ]; then
+  fail "mount HUNG (ls timed out)"
+  hint "reload the TabFS extension in the browser, then re-run doctor."
+  printf '\n%sMount wedged — stopping.%s\n' "$B" "$X"; exit 1
+else
+  fail "mount present but unreadable (ls failed)"
+  hint "the native program may be running without the extension connected;"
+  hint "reload the extension in the browser, then re-run doctor."
+fi
+
+# === 3. expected top-level structure ======================================
+for d in tabs bookmarks windows runtime; do
+  if run 5 test -e "$MOUNT/$d"; then pass "$d/ present"
+  else fail "$d/ missing — is this really a TabFS mount?"; fi
+done
+
+# === 4. how many tabs (informational) =====================================
+n=$(run 5 ls "$MOUNT/tabs/by-id" 2>/dev/null | grep -c '^[0-9]')
+[ "${n:-0}" -gt 0 ] && pass "$n open tab(s) visible"
+
+# === 5. native-messaging manifest registered ==============================
+# Without this JSON (naming the native program AND allowing the extension ID),
+# the extension can't talk to the filesystem at all.
+manifest=
+for base in \
+  "$HOME/.config/google-chrome" "$HOME/.config/chromium" \
+  "$HOME/.config/google-chrome-beta" "$HOME/.config/google-chrome-unstable" \
+  "$HOME/Library/Application Support/Google/Chrome" \
+  "$HOME/Library/Application Support/Chromium" ; do
+  f="$base/NativeMessagingHosts/com.rsnous.tabfs.json"
+  [ -f "$f" ] && { manifest="$f"; break; }
+done
+# Firefox uses a different dir layout
+[ -z "$manifest" ] && for f in \
+  "$HOME/.mozilla/native-messaging-hosts/com.rsnous.tabfs.json" \
+  "$HOME/Library/Application Support/Mozilla/NativeMessagingHosts/com.rsnous.tabfs.json"; do
+  [ -f "$f" ] && { manifest="$f"; break; }
+done
+if [ -n "$manifest" ]; then
+  pass "native manifest registered ($manifest)"
+  # sanity: does the path it points at exist?
+  bin=$(sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -1)
+  if [ -n "$bin" ] && [ ! -e "$bin" ]; then
+    warn "manifest points at a native program that doesn't exist: $bin"
+    hint "rebuild fs/tabfs or fix the \"path\" in the manifest."
+  fi
+else
+  warn "no native-messaging manifest found in the usual locations"
+  hint "the extension can't reach the filesystem without it; run the TabFS"
+  hint "install step that registers com.rsnous.tabfs.json (it must list your"
+  hint "extension's ID, which you get after loading the unpacked extension)."
+fi
+
+# === 6. a FUSE provider is installed ======================================
+if   command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1; then
+  pass "FUSE available (fusermount)"
+elif [ -d /Library/Filesystems/macfuse.fs ] || command -v mount_macfuse >/dev/null 2>&1; then
+  pass "FUSE available (macFUSE)"
+else
+  warn "no FUSE provider detected"
+  hint "install libfuse (Linux), macFUSE (macOS), or WinFsp (Windows)."
+fi
+
+# === verdict ==============================================================
+echo
+if [ "$problems" -eq 0 ]; then
+  printf '%sReady.%s  e.g.  cat %s/tabs/last-focused/title.txt\n' "$G$B" "$X" "$MOUNT"
+  exit 0
+else
+  printf '%s%d problem(s) above — fix those first.%s\n' "$R$B" "$problems" "$X"
+  exit 1
+fi
