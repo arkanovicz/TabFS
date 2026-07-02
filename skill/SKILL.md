@@ -116,20 +116,23 @@ echo 'https://example.com' > ~/chrome/bookmarks/Bookmarks_bar/Example
 ### Console capture
 
 `cat ~/chrome/tabs/by-id/<id>/console` shows that tab's `console.*` output and
-uncaught exceptions. The **first read attaches the debugger** and replays the
-page's existing console history; new messages stream in afterward. `: > console`
-clears the buffer.
+uncaught exceptions. The first read attaches the debugger and replays the page's
+console history; it then keeps capturing, so later reads pick up new messages.
+`: > console` clears the buffer.
 
 ```sh
-cat ~/chrome/tabs/by-id/1234/console        # history + live messages
+cat ~/chrome/tabs/by-id/1234/console        # history + everything since
 grep -i error ~/chrome/tabs/by-id/1234/console
 : > ~/chrome/tabs/by-id/1234/console        # clear
 ```
 
 Note: reading `console` (or anything under `debugger/`) attaches Chrome's
 DevTools protocol, which shows a **"TabFS started debugging this browser"**
-banner on that tab until the extension reloads. Only the tabs you actually read
-get it. Don't reach for `console`/`debugger/` unless the task needs it.
+banner on that tab. For `console` the banner is bounded: TabFS detaches (and the
+banner clears) as soon as the tab **navigates to a new page**, so it never rides
+along to a page you didn't read. `debugger/` routes stay attached until the
+extension reloads. If you have DevTools open on a tab, reading its `console`
+fails (EIO) rather than stealing your DevTools session — close DevTools first.
 
 ## Gotchas
 

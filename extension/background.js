@@ -592,13 +592,40 @@ see https://developer.chrome.com/extensions/tabs.`,
     });
 
     // When our debugger session ends (tab closed, DevTools took over,
-    // navigation to an undebuggable page), forget the attach/enable state so
-    // the next operation re-attaches and re-enables from scratch.
+    // navigation to an undebuggable page, our own detach-on-navigation below),
+    // forget the attach/enable state AND the buffered console so the next
+    // operation re-attaches from scratch and doesn't show the previous page's
+    // console lines mixed into the new page's.
     if (chrome.debugger) chrome.debugger.onDetach.addListener((source, reason) => {
       delete TabManager.attachedTabs[source.tabId];
       delete TabManager.enabledForTab[source.tabId];
       delete TabManager.scriptsForTab[source.tabId];
+      delete TabManager.consoleForTab[source.tabId];
     });
+
+    // Bound the "started debugging this browser" banner's lifetime. The moment
+    // a tab we're attached to starts loading a NEW page, drop the debugger --
+    // otherwise the session (and its banner) rides along from the page the
+    // agent actually read into whatever the user browses to next, which reads
+    // as the banner "randomly" showing up on a page nothing touched. status ===
+    // 'loading' marks real document navigations (not SPA pushState), so
+    // same-page console capture between reads is unaffected.
+    if (chrome.tabs && chrome.tabs.onUpdated) {
+      chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+        if ((changeInfo.status === 'loading' || changeInfo.url) &&
+            TabManager.attachedTabs[tabId]) {
+          // Clear our bookkeeping synchronously -- we intend to be detached, so
+          // the next read must re-attach and re-replay the NEW page's console.
+          // (detach() can reject while the tab is mid-navigation; don't let that
+          // leave us "attached" in our own map and hand back a stale buffer.)
+          delete TabManager.attachedTabs[tabId];
+          delete TabManager.enabledForTab[tabId];
+          delete TabManager.consoleForTab[tabId];
+          delete TabManager.scriptsForTab[tabId];
+          detachDebugger(tabId).catch(() => {});
+        }
+      });
+    }
 
     return {
       scriptsForTab: {},
@@ -626,9 +653,11 @@ see https://developer.chrome.com/extensions/tabs.`,
         try { await attachDebugger(tabId); }
         catch (e) {
           if (e.message.indexOf('Another debugger is already attached') !== -1) {
-            // someone else (e.g. DevTools) holds it; take it over
-            await detachDebugger(tabId);
-            await attachDebugger(tabId);
+            // Someone else -- almost always the user's own DevTools -- holds
+            // the session. DON'T yank it out from under them (that closes their
+            // DevTools AND flashes our banner). Back off; the read fails with a
+            // quiet EIO rather than a surprise.
+            throw new UnixError(unix.EIO);
           } else { throw e; }
         }
         TabManager.attachedTabs[tabId] = true;
@@ -745,10 +774,19 @@ see https://developer.chrome.com/extensions/tabs.`,
   Routes["/tabs/by-id/#TAB_ID/console"] = {
     description: `Console output (console.* calls and uncaught exceptions) for this tab.
 Reading this file attaches the debugger and replays the page's console history,
-then streams new messages. Truncate (e.g. \`: > $0\`) to clear the buffer.`,
+then keeps capturing new messages. The debugger detaches (and the "started
+debugging" banner clears) as soon as the tab navigates to a new page, or when
+the extension reloads. Truncate (e.g. \`: > $0\`) to clear the buffer.`,
     usage: ['cat $0',
             ': > $0'],
     ...makeRouteWithContents(async ({tabId}) => {
+      // Stay attached so we don't miss messages between reads: Chrome replays a
+      // page's console history to a debugger client only ONCE per page load, so
+      // a detach-after-read loses everything that happens before the next read
+      // (and re-enabling Runtime wouldn't replay it again). The banner that
+      // comes with staying attached is bounded instead by detaching on
+      // navigation (see chrome.tabs.onUpdated below) -- that's what stops it
+      // riding along to a page the agent never actually touched.
       await TabManager.debugTab(tabId);
       await TabManager.enableDomainForTab(tabId, "Runtime");
       const entries = TabManager.consoleForTab[tabId] || [];
@@ -1287,12 +1325,18 @@ async function onMessage(req) {
   } catch (e) {
     // A UnixError is a deliberate, mapped filesystem result (ENOENT,
     // EIO for an unreachable page, etc.) -- normal control flow, so
-    // don't log it. Only unexpected raw errors are worth a console line.
-    if (!(e instanceof UnixError)) { console.error(e); }
-    response = {
-      op: req.op,
-      error: e instanceof UnixError ? e.error : unix.EIO
-    };
+    // don't log it. A stale tab id ("No tab with id: N") is the same
+    // thing: the filesystem still has a path for a tab the browser has
+    // since closed -- map it to ENOENT and stay quiet. Only genuinely
+    // unexpected raw errors are worth a console line.
+    if (e instanceof UnixError) {
+      response = { op: req.op, error: e.error };
+    } else if (/No tab with id/.test(e.message || '')) {
+      response = { op: req.op, error: unix.ENOENT };
+    } else {
+      console.error(e);
+      response = { op: req.op, error: unix.EIO };
+    }
   }
   /* console.timeEnd(req.op + ':' + req.path);*/
 
