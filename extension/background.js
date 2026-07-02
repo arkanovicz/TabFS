@@ -1093,6 +1093,52 @@ or a single bookmark (a file whose contents are its URL).`,
   };
 })();
 
+(function() {
+  // chrome.history gives queryable visit records, not the full ordered
+  // per-visit log the chrome://history page shows. search({text:''})
+  // returns the most-recently-visited URLs (deduped), newest first.
+  function formatItems(items) {
+    return items
+      .sort((a, b) => b.lastVisitTime - a.lastVisitTime)
+      .map(it => [new Date(it.lastVisitTime).toISOString(),
+                  it.visitCount,
+                  it.url,
+                  (it.title || '').replace(/[\t\n]/g, ' ')].join('\t'))
+      .join('\n') + (items.length ? '\n' : '');
+  }
+
+  Routes["/history"] = {
+    description: `Browsing history (chrome.history), as queryable text files.`,
+    usage: 'ls $0',
+    async readdir() {
+      return { entries: [".", "..", "by-time", "search"] };
+    }
+  };
+  Routes["/history/by-time"] = {
+    description: `The most-recently-visited URLs, newest first, as TSV:
+lastVisitTime<TAB>visitCount<TAB>url<TAB>title. Deduped by URL. Capped at 1000.`,
+    usage: ['cat $0', 'grep -i github $0'],
+    ...makeRouteWithContents(async () => {
+      const items = await browser.history.search({ text: '', maxResults: 1000 });
+      return formatItems(items);
+    })
+  };
+  Routes["/history/search"] = {
+    description: `Query history: cat a file named after your search text.`,
+    usage: 'cat $0/example.com',
+    async readdir() { return { entries: [".", ".."] }; }
+  };
+  Routes["/history/search/:QUERY"] = {
+    description: `Free-text history search for :QUERY (matches URL and title),
+same TSV format as by-time. Capped at 1000.`,
+    usage: 'cat $0',
+    ...makeRouteWithContents(async ({query}) => {
+      const items = await browser.history.search({ text: query, maxResults: 1000 });
+      return formatItems(items);
+    })
+  };
+})();
+
 Routes["/runtime/reload"] = {
   async write({buf}) {
     await browser.runtime.reload();

@@ -69,6 +69,9 @@ extension in the browser — you cannot fix that from the shell.
 │  ├─ by-title/  by-window/  the same tabs, indexed differently
 │  ├─ last-focused           symlink to the tab the user is looking at
 │  └─ create                 echo a URL > to open a new tab
+├─ history/                  browsing history, queryable (chrome.history)
+│  ├─ by-time                recent URLs, newest first, TSV (deduped, cap 1000)
+│  └─ search/<text>          cat to free-text search URL+title
 ├─ bookmarks/                the bookmark tree as folders + files
 │  ├─ Bookmarks_bar/ Other_bookmarks/ Mobile_bookmarks/
 │  │     a folder = a bookmark folder; a file = a bookmark (contents: its URL)
@@ -111,7 +114,20 @@ echo 'https://example.com' > ~/chrome/tabs/create
 # Bookmarks: search the archive, add one
 grep -rl example.com ~/chrome/bookmarks/ 2>/dev/null
 echo 'https://example.com' > ~/chrome/bookmarks/Bookmarks_bar/Example
+
+# History: what did I visit recently / matching a term?
+head ~/chrome/history/by-time                 # lastVisitTime  visits  url  title
+cat ~/chrome/history/search/kialo             # free-text over URL + title
 ```
+
+### History
+
+`chrome.history` gives **queryable visit records, not the full ordered
+per-visit log** the `chrome://history` page shows: `search({text:''})` returns
+the most-recently-visited URLs, **deduped by URL**, newest first (cap 1000).
+Each line is `lastVisitTime<TAB>visitCount<TAB>url<TAB>title`. `by-time` is the
+recent set; `search/<text>` matches text against URL and title. Empty search
+result = no match (an empty file), not an error.
 
 ### Console capture
 
